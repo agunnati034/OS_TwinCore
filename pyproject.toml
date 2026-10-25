@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "twincoreos"
+version = "0.1.0"
+description = "Host-process telemetry prototype for a risk-aware checkpointing digital twin"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "psutil>=5.9",
+]
+
+[project.scripts]
+twincoreos = "twincoreos.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
