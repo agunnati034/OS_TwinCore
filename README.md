@@ -1,18 +1,27 @@
 # TwinCoreOS
 
-TwinCoreOS is an OS/RTOS-focused fault-tolerance prototype. Its current
-demonstration is a **host-process system**: a Python supervisor starts real
-worker subprocesses, samples OS-reported measurements through `psutil`,
-maintains per-worker Digital Twins, computes a baseline risk assessment,
-stores validated application-state checkpoints, and demonstrates controlled
-worker termination and application-state recovery through a local API and
-React dashboard.
+TwinCoreOS is an OS/RTOS-focused fault-tolerance prototype. Its dashboard
+shows a **FreeRTOS-on-QEMU embedded task risk assessment** when UART telemetry
+is connected, while a separate host-monitoring section supervises real Python
+worker subprocesses. Host monitoring samples OS measurements through `psutil`,
+maintains per-worker Digital Twins, and uses a trained host-telemetry anomaly
+detector when its model artifact is available (otherwise a baseline
+assessment). A separate embedded Isolation Forest can be trained from
+explicitly curated FreeRTOS UART observations and runs in shadow mode only;
+it never replaces the embedded threshold policy or dispatches checkpoints.
+The system also demonstrates validated host application-state
+checkpoints and controlled worker recovery through a local API and React
+dashboard.
 
-It is not a kernel or RTOS task monitor, a trained or calibrated failure
-predictor, or arbitrary process-memory restoration. A separate RV32
-FreeRTOS-on-QEMU task prototype is under `embedded/`; its UART telemetry can
-be forwarded into a separate embedded-task view in the dashboard. Embedded
-tasks remain distinct from supervised host processes and their Digital Twins.
+It is not a kernel-integrated RTOS monitor, a calibrated failure predictor, or
+arbitrary process-memory restoration. The optional Isolation Forest detects
+statistical deviations in host telemetry; it does not predict worker failure.
+The separate RV32 FreeRTOS-on-QEMU prototype under `embedded/` sends actual
+task telemetry over emulated UART through the bridge and backend embedded-risk
+policy into the main Risk Assessment panel. Embedded task measurements and
+risk remain separate from host-process identities, metrics, and the host
+Isolation Forest. Embedded shadow anomaly scores are likewise not calibrated
+failure probabilities and are not used as embedded risk scores.
 
 ## Prerequisites and project structure
 
@@ -25,8 +34,9 @@ Requirements for the host prototype:
   or matching configuration changes to the API command, Vite server, and
   `VITE_API_URL`.
 
-No Docker, C compiler, scikit-learn, or emulator is required for the current
-host-process demonstration.
+No Docker, C compiler, or emulator is required for the host-process
+demonstration. scikit-learn is installed with the Python package for host
+telemetry anomaly detection.
 
 ```text
 src/twincoreos/       Worker, monitor, Digital Twin, risk, checkpoints, recovery, API
@@ -35,13 +45,13 @@ frontend/src/         React dashboard
 frontend/package.json Frontend commands and dependencies
 frontend/package-lock.json Locked frontend dependencies for reproducible npm ci
 frontend/.env.example Frontend API URL template
-pyproject.toml        Python package metadata and runtime dependency
+pyproject.toml        Python package metadata and runtime dependencies
 ```
 
 ## Fresh setup
 
 From the project root, create an isolated Python environment and install the
-package and its runtime dependency (`psutil`):
+package and its runtime dependencies (`psutil` and `scikit-learn`):
 
 ```sh
 python3 -m venv .venv
@@ -83,8 +93,10 @@ Start these services in separate terminals, from the project root.
 
 The API starts one monitor runtime and one worker pool for its lifetime. Keep
 this terminal running; dashboard polling and API reads do not start more
-workers. To stop the backend, press **Ctrl-C in Terminal 1**. The service
-closes the HTTP server and shuts down and reaps its supervised workers.
+workers. Startup logs show the actual API listening address and whether the
+trained Isolation Forest or baseline fallback is active. To stop the backend,
+press **Ctrl-C in Terminal 1**. The service closes the HTTP server and shuts
+down and reaps its supervised workers.
 
 **Terminal 2 — React/Vite dashboard:**
 
@@ -281,12 +293,13 @@ capture arbitrary process memory, thread stacks, file descriptors, OS execution
 context, or RTOS task context. Restoring a saved state into a fresh worker is
 not restoration of the original process.
 
-## Baseline failure-risk predictor
+## Risk predictors
 
 `src/twincoreos/risk_predictor.py` implements a replaceable `RiskPredictor`
-interface with a deterministic `BaselineRiskPredictor`. There is no suitable
-labeled failure dataset in this prototype, so this is a transparent heuristic,
-**not a trained model and not a calibrated probability of failure**.
+interface with a deterministic `BaselineRiskPredictor`. It remains available
+for comparison and is the explicit fallback if an ML artifact is missing,
+invalid, or inference fails. It is a transparent heuristic, **not a calibrated
+probability of failure**.
 
 The default score adds configured evidence contributions and clamps the result
 to `[0, 1]`: high CPU utilization adds 0.30 (elevated CPU adds 0.12 instead);
@@ -303,9 +316,122 @@ imputed.
 
 Each assessment includes the worker ID/PID, score/category, observed features,
 explanation, assessment and expiry timestamps, and category-transition
-metadata. Its validity period defaults to three sampling intervals. These
-thresholds and scores are configurable in code; they are not statistically
-fitted, evaluated, or calibrated.
+metadata. Its validity period defaults to three sampling intervals. The
+baseline predictor remains useful as a comparison point; its thresholds and
+scores are not statistically fitted, evaluated, or calibrated.
+
+### Train the host-telemetry Isolation Forest
+
+The repository contains **no suitable labeled historical worker-failure
+dataset**. The initial ML model is therefore an unsupervised scikit-learn
+Isolation Forest, not a supervised failure classifier. It identifies unusual
+host-worker observations relative to the observations it was fitted on. It
+does not estimate failure probability, establish a failure horizon, identify a
+cause, or guarantee that an inlier worker is healthy.
+
+Collect real host-worker telemetry using the existing monitor. Its stdout is
+JSON Lines containing telemetry and other event types; the trainer selects
+only records with `"type": "telemetry"`. This preserves host-process
+measurements and does not mix in FreeRTOS task telemetry.
+
+```sh
+.venv/bin/python -m twincoreos monitor \
+  --workers 2 --duration 120 --sample-interval 1 --memory-mib 8 \
+  > .twincoreos/host-telemetry.jsonl
+```
+
+The training dataset is that collected JSONL stream: each accepted record is
+one actual host-worker observation with fields including `task_id`, `pid`,
+`process_created_at_utc`, `captured_at_utc`,
+`cpu_utilization_percent_one_core`, `memory_rss_bytes`, `cpu_interval_seconds`,
+`process_status`, and `measurement_errors`. Non-telemetry events are ignored;
+malformed JSON or invalid telemetry fails training with a line-specific error.
+The trainer groups and chronologically orders observations by worker process
+identity to derive CPU/RSS trends and sample gaps. It requires at least 20
+telemetry observations. This minimum is an input check, **not evidence of
+adequate coverage or predictive accuracy**. Do not add synthetic rows to meet
+the requirement.
+
+Train and persist a reproducible model artifact:
+
+```sh
+.venv/bin/python -m twincoreos.train_risk_model \
+  --input .twincoreos/host-telemetry.jsonl \
+  --output .twincoreos/models/host-isolation-forest.joblib \
+  --contamination 0.05 --random-state 42
+```
+
+`contamination` is the expected outlier fraction used to set the Isolation
+Forest decision boundary; adjust it for the collection workload. Training fits
+a median imputer, standard scaler, and Isolation Forest and writes the
+preprocessing and model together. There is no per-request or per-sample
+retraining. Training reports the model type and number of observations; it
+does not report failure-prediction accuracy because there are no failure
+labels.
+
+Start the backend with that artifact (both `monitor` and `serve` accept the
+same options):
+
+```sh
+.venv/bin/python -m twincoreos serve \
+  --workers 2 --sample-interval 1 \
+  --risk-model .twincoreos/models/host-isolation-forest.joblib
+```
+
+Check `GET /api/risk` or the existing `GET /api/dashboard` response. ML-backed
+assessments preserve the existing `RiskAssessment` and `to_dict()` fields. The
+`observed_features` object includes `model_type: "isolation_forest"`,
+`anomaly_score`, and `anomaly_status` (`"anomalous"` or `"inlier"`), in
+addition to the measured feature summary. `anomaly_score` is the signed
+distance relative to the fitted decision boundary (`> 0` is anomalous); it is
+not a failure probability.
+
+For compatibility with the existing API and dashboard, `risk_score` and
+`risk_category` remain present. The default mapping explicitly assigns score
+`0.0` to inliers (LOW) and `0.60` to anomalies (HIGH), using the existing
+category cutoffs. Configure that compatibility mapping at launch with
+`--normal-risk-score` and `--anomaly-risk-score` (each in `[0, 1]`); for
+example, an anomaly score of `0.30` maps to MEDIUM with the current thresholds.
+The score is only a category-compatibility index and **must not be interpreted
+as probability or calibrated risk**. The dashboard labels this value as an
+index rather than a percentage. A newly observed worker is shown as
+`WARMING_UP` with no score until a second telemetry sample is available for
+per-worker trend features; this does not change the separate process-health
+status. Failed worker records remain associated with their original worker ID
+after a replacement starts, while the replacement's current health and risk
+are assessed independently. The API response retains its existing fields.
+
+The fixed model features are one-core CPU utilization, RSS, CPU and RSS
+observation-to-observation trends, sample-to-sample telemetry gap, Digital
+Twin health, Twin staleness, CPU/RSS missingness, measurement-error count, and
+process-status change. Health states are encoded separately, and unavailable
+numeric values are median-imputed from the real training observations (with
+explicit missing indicators). Feature order is versioned and validated when
+loading, and the artifact's exact scikit-learn version must match the runtime;
+otherwise the service logs a warning and falls back to the baseline. Stale
+observations and missing values remain visible in the returned feature summary.
+
+When the default artifact is absent (the checked-in project does not include a
+trained model), startup logs a warning and uses `BaselineRiskPredictor`. A
+corrupt/incompatible artifact or runtime inference failure also logs the
+fallback and uses the baseline without taking down monitoring. Confirmed
+worker failure always bypasses ML and receives the deterministic baseline
+failure assessment. ML outputs alone do not initiate checkpointing or
+recovery; existing checkpoint validation, recovery controls, and embedded
+FreeRTOS behavior remain unchanged.
+
+The model is persisted with joblib. Only load model artifacts that you trust;
+joblib artifacts use Python object serialization and loading an untrusted
+artifact can execute code. Retrain after changing the feature schema or scikit-
+learn versions and verify the logged `model_type`/fallback status before
+interpreting assessments.
+
+To compare against the retained heuristic, run the same telemetry workload
+once with the trained artifact and once with a nonexistent model path (for
+example, `--risk-model /tmp/no-such-model.joblib`). Compare `risk_category`,
+the ML `anomaly_status`/`anomaly_score`, and the baseline's additive
+`observed_features`/explanation. This is a qualitative comparison only, not a
+failure-prediction benchmark.
 
 ## Errors, process validation, and limitations
 
@@ -505,23 +631,22 @@ export PATH="$HOME/.local/riscv/bin:$PATH"
 ```
 
 The bridge starts QEMU itself and forwards UART task records to the running
-backend. Open <http://127.0.0.1:5173/> and inspect **Embedded RTOS**; the
-execution counters and ticks update from incoming QEMU records. The same
-section shows separate embedded operational-risk assessments from the
-`/api/embedded/risk` policy, including its matched rule and recommendation.
-This is an operational heuristic, not a trained or calibrated failure
-probability. The default stack-reserve threshold is 32 words and does not
-recommend a checkpoint for the observed QEMU workload. To demonstrate an
-actual policy-triggered checkpoint, start the backend with the explicit
-`--embedded-stack-reserve-threshold-words 200` option. The bridge polls the
-read-only risk endpoint after real telemetry and writes the validated
-`CHECKPOINT sensor-sampler` line to QEMU's UART input only when a fresh,
-valid assessment recommends it. Firmware consumes that line at its NS16550
-receive register, requests the existing task safe-point checkpoint, validates
-the embedded record, and runs the existing replacement/restore sequence.
-UART lifecycle events are forwarded to the backend. Duplicate requests are
-latched until a fresh normal assessment clears the policy condition; unknown
-or stale telemetry never triggers or re-arms a request.
+backend. Open <http://127.0.0.1:5173/> and inspect the main **Risk Assessment**
+panel for both FreeRTOS tasks; host workers remain in their separate host
+monitoring section. Task state, measured stack reserve, configured threshold,
+telemetry age, policy category/index, explanation, and checkpoint status all
+come from the backend embedded-risk policy. Its discrete policy index is not a
+trained or calibrated failure probability. The default threshold is 32 words;
+the fault demo below uses 96 words so the firmware's measured reserve drop
+crosses the configured rule. The UART bridge can request the bounded
+`sensor-sampler` stack-pressure fault only after both tasks have fresh LOW-risk
+telemetry. The bridge then forwards actual UART telemetry and lifecycle events;
+the backend recommends checkpointing only for `sensor-sampler`, and the
+firmware performs its supported safe-point application-state checkpoint and
+restart/restore. `control-loop` checkpointing is unsupported and is not
+requested. Duplicate checkpoint requests are latched until a fresh normal
+assessment clears the policy condition; unknown or stale telemetry never
+triggers or re-arms a request.
 
 This creates only an embedded RAM application-state checkpoint; it does not
 alter host-process checkpoints and does not restore arbitrary task stacks,
@@ -531,72 +656,314 @@ capture UART output without forwarding it, use `make -C embedded run`.
 
 The backend validates schema version 1 and de-duplicates each task execution
 within a bridge session. `/api/embedded/tasks` returns retained samples and
-`/api/dashboard` includes the same separate `embedded_tasks` data. See the
-[embedded guide](./embedded/README.md) for the field definitions, toolchain
-setup, and troubleshooting. The firmware also demonstrates one controlled
-application-level checkpoint and restart of `sensor-sampler`, saving only its
-counter and accumulator in a validated versioned RAM record. The QEMU test
-checks restored state and continued progress while `control-loop` remains
-active. This does not restore task stacks, registers, peripheral state, or
-kernel state and is not FreeRTOS kernel-task recovery.
+`/api/dashboard` includes the same `embedded_tasks` data and policy
+assessments. See the [embedded guide](./embedded/README.md) for the field
+definitions, toolchain setup, and troubleshooting. The supported
+`sensor-sampler` checkpoint saves only its counter and accumulator in a
+validated, versioned RAM record. The QEMU test checks restored state and
+continued progress. This does not restore task stacks, registers, peripheral
+state, or kernel state and is not FreeRTOS kernel-task recovery.
 
-### Final risk-triggered demonstration and verification
+The dashboard's current-session checkpoint slot is populated only by a
+firmware-confirmed `checkpoint_saved` event and is cleared when telemetry
+identifies a new QEMU bridge session. The recovery history is separate: it
+retains up to 20 run records in the running backend process, including saved,
+restored, and post-restore application-state evidence. Historical records do
+not mean that the volatile checkpoint still exists in QEMU RAM. The embedded
+storage panel reports the actual firmware record size when a current-session
+save is confirmed; one RAM slot is available and no byte budget is configured.
+Risk-category transitions are also retained with task, time, measured reserve,
+threshold, and policy index, while the live task card continues to reflect the
+latest fresh telemetry. LOW/0 and ELEVATED/100 are discrete policy states, not
+failure probabilities.
 
-Run the following in three terminals from the project root (the firmware
-toolchain and QEMU must already be installed):
+### Live embedded fault, risk, and recovery demonstration
+
+The demo requires the RISC-V GCC toolchain supporting `rv32imac/ilp32`, QEMU,
+the project's `.venv`, and installed frontend dependencies. Run these in
+three terminals from the repository root. The backend creates an isolated
+temporary checkpoint directory so the demo does not write into existing
+checkpoint data.
+
+**Terminal 1 — backend and host monitoring:**
 
 ```sh
-# Terminal 1: backend with an explicit demonstration threshold
-.venv/bin/python -m twincoreos serve \
-  --workers 2 --memory-mib 8 --sample-interval 1 --checkpoint-interval 5 \
+DEMO_CHECKPOINT_DIR=$(mktemp -d /tmp/twincoreos-embedded-demo.XXXXXX)
+printf 'Demo checkpoints: %s\n' "$DEMO_CHECKPOINT_DIR"
+PYTHONPATH=src .venv/bin/python -m twincoreos serve \
+  --workers 2 \
+  --memory-mib 8 \
+  --sample-interval 1 \
+  --checkpoint-interval 5 \
   --checkpoint-budget-bytes 10485760 \
-  --checkpoint-dir .twincoreos/dashboard-checkpoints \
-  --embedded-stack-reserve-threshold-words 200 \
-  --host 127.0.0.1 --port 8765
-
-# Terminal 2: dashboard
-cd frontend && npm run dev
-
-# Terminal 3: firmware build if needed, then start the UART bridge
-export PATH="$HOME/.local/riscv/bin:$PATH"
-make -C embedded build
-.venv/bin/python -m twincoreos embedded-bridge
+  --checkpoint-dir "$DEMO_CHECKPOINT_DIR" \
+  --embedded-stack-reserve-threshold-words 96 \
+  --host 127.0.0.1 \
+  --port 8765
 ```
 
-Open <http://127.0.0.1:5173/> and inspect **Embedded RTOS**. Verify that
-`sensor-sampler` and `control-loop` have distinct RTOS task IDs and advancing
-execution counts; host workers remain in their separate PID/CPU/RSS view. To
-inspect API data, use `curl -fsS http://127.0.0.1:8765/api/embedded/risk` and
-`curl -fsS http://127.0.0.1:8765/api/dashboard`. After the bridge exits,
-telemetry becomes stale and the policy returns `unknown` with no
-recommendation; the latest checkpoint outcome remains available.
+Keep this terminal open. Confirm it logs the actual listening address and
+whether the trained host Isolation Forest or baseline host predictor is
+active. That host predictor is not used for embedded task risk.
+The serve CLI default for this setting is 32 words; this demo explicitly sets
+96. The active value comes from this CLI option, not a frontend default; 200
+words was an earlier requested demonstration value, not the current command's
+configuration. The 96-word threshold makes the measured bounded fault a
+policy-triggering signal while allowing baseline task telemetry to be checked
+against the same explicit rule. In a recent live two-cycle QEMU test, both
+tasks reported 246 words before injection and the injected sensor task reported
+95 words; the policy therefore crossed the 96-word boundary using measured
+telemetry. These are observed readings, not fixed guarantees. The backend
+returns the configured value in each assessment; it is never hardcoded in the
+dashboard.
 
-Reproducible verification commands:
+**Terminal 2 — React/Vite dashboard:**
+
+```sh
+cd frontend
+npm run dev
+```
+
+Open <http://127.0.0.1:5173/>. The main **Risk Assessment** panel renders
+`sensor-sampler` and `control-loop` assessments from the backend policy;
+host-worker PID/CPU/RSS risk remains separate.
+
+**Terminal 3 — build firmware and run the live UART fault demo:**
+
+```sh
+export PATH="$HOME/.local/riscv/bin:$PATH"
+make -C embedded build
+PYTHONPATH=src .venv/bin/python -m twincoreos embedded-bridge
+```
+
+Open the dashboard and use **Embedded recovery demonstration → Inject fault
+& verify application-state recovery**. The API accepts this request only when
+both tasks have fresh, running LOW assessments. The bridge polls the
+embedded-only command endpoint and sends the supported
+`INJECT_STACK_PRESSURE sensor-sampler <run-id>` command through QEMU UART.
+Each request gets a unique run ID, and the firmware echoes it in task telemetry
+and lifecycle acknowledgements. The dashboard retains separate timestamped
+evidence for each run. The host-worker fault/recovery API remains separate and
+is not invoked by this embedded control.
+
+To run the same workflow without the dashboard button, issue the request once
+and wait for verified completion plus fresh LOW telemetry from both tasks
+before issuing it a second time:
+
+```sh
+curl -fsS -X POST http://127.0.0.1:8765/api/embedded/fault-injection \
+  -H 'Content-Type: application/json' \
+  -d '{"task_id":"sensor-sampler","confirm":true}'
+curl -fsS http://127.0.0.1:8765/api/embedded/fault-injection
+curl -fsS http://127.0.0.1:8765/api/embedded/risk
+```
+
+The firmware uses a bounded 144-word local buffer in `sensor-sampler` and
+reports the actual FreeRTOS stack high-water measurement while that frame is
+live. The measured reserve drops to or below the configured 96-word threshold,
+so the backend—not React—updates the task to ELEVATED and recommends a
+checkpoint. Both normal task stacks and replacement task stacks are sized to
+three times `configMINIMAL_STACK_SIZE`; this provides sufficient measured
+reserve for normal operation and leaves the bounded fault observable without
+changing the configured risk threshold. The bridge sends the
+backend-authorized checkpoint command; the firmware reports request, save,
+restore start, restore verification, and restored-state progress as separate
+UART events. It saves only `sensor-sampler` application state (counter and
+accumulator) in a validated RAM checkpoint. A later injection is enabled only
+after the backend confirms recovery completion and receives newer, same-run
+telemetry showing progress with both tasks back in fresh LOW state. Click the
+control a second time only after it becomes enabled; the UI never reuses an
+older run or checkpoint. `control-loop` continues reporting independently and
+never receives a checkpoint request. This verifies application-state
+restoration and progress, not whole-task/FreeRTOS context recovery.
+
+The supported CLI-only alternative to the dashboard button is
+`.venv/bin/python -m twincoreos embedded-bridge --inject-stack-pressure sensor-sampler`;
+it injects automatically after the bridge sees both tasks in fresh LOW state.
+The bridge continues polling for dashboard requests after this one-shot
+injection and recovery.
+
+To confirm actual task and policy data while the bridge is running:
+
+```sh
+curl -fsS http://127.0.0.1:8765/api/embedded/tasks
+curl -fsS http://127.0.0.1:8765/api/embedded/risk
+curl -fsS http://127.0.0.1:8765/api/embedded/fault-injection
+curl -fsS http://127.0.0.1:8765/api/dashboard
+```
+
+The supported fault is a bounded stack-pressure event, not arbitrary memory
+corruption or a physical sensor fault. `sensor-sampler` is the only task with
+checkpoint/restart support; `control-loop` correctly reports checkpointing as
+unsupported. The discrete risk index is a policy indicator, not a failure
+probability. When the bridge is stopped, telemetry eventually becomes stale
+and the policy reports UNKNOWN rather than healthy/zero-risk.
+
+Stop the bridge/QEMU, backend, and Vite server with **Ctrl-C** in their
+respective terminals. For a standalone serial view without backend forwarding, use `make -C embedded
+run`; exit the QEMU monitor with **Ctrl-A**, then **X**. Do not run that
+standalone mode concurrently with the bridge.
+
+### Verification
+
+Run the actual firmware build, direct recovery and full policy-driven QEMU
+integration, Python suite, and frontend checks:
 
 ```sh
 export PATH="$HOME/.local/riscv/bin:$PATH"
 make -C embedded build
 make -C embedded test-recovery
-PATH="$HOME/.local/riscv/bin:$PATH" PYTHONPATH=src \
-  .venv/bin/python -m unittest discover -s tests -v
-cd frontend && npm run build && npm run lint
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
+cd frontend
+npm test
+npm run lint
+npm run build
 ```
 
-On the verified setup, the full Python suite completed with 99 tests passing;
-the QEMU policy integration observed 101 stack-high-water words against the
-explicit 200-word threshold, then a real `checkpoint_saved` record
-(`counter=1`, `accumulator=3903643392`, `integrity_hash=3567634840`), restore,
-then progressed from `counter=1` to `counter=2` with
-`accumulator=2047425920`, while `control-loop` reached execution count 2 and
-continued through count 10. The observed UART lifecycle was
-`checkpoint_requested → checkpoint_saved → task_restart_started →
-task_restarted → restore_succeeded → task_progress → recovery_completed`.
-Firmware build, direct QEMU recovery test, frontend build, and frontend lint
-also passed. These values document an actual run, not seeded runtime data;
-subsequent runs may differ.
-Focused tests also cover below-threshold and stale/invalid telemetry, duplicate
-request latching/re-arming, and rejection of mismatched checkpoint hashes.
-There is no deterministic firmware fault-injection hook for task creation or
-restore-resource failures, so those failure branches are not claimed as
-QEMU-tested; the firmware reports them as failures and does not emit successful
-recovery completion.
+The live QEMU integration test executes two sequential dashboard/API-triggered
+runs with distinct run IDs. It verifies fresh baseline LOW assessments,
+run-correlated UART fault acknowledgements and below-threshold measurements,
+intermediate ELEVATED recommendations, checkpoint integrity, saved/restored
+application-state equality, counter progress beyond restored state, and fresh
+post-recovery LOW telemetry before permitting the second run. `control-loop`
+telemetry remains independently assessed and checkpointing stays unsupported.
+The test uses live QEMU telemetry; values can vary between runs.
+
+### Embedded ML shadow pipeline (Stage 1)
+
+The embedded-specific Isolation Forest is an optional, unsupervised shadow
+detector. It uses only schema-validated `sensor-sampler` and `control-loop`
+UART telemetry, with per-task temporal features. It does not consume host
+worker PID, CPU, RSS, host risk, or host failure data. The existing embedded
+threshold policy remains the sole source of operational risk and checkpoint
+recommendations; `GET /api/embedded/ml` and `/api/dashboard` expose separate
+ML assessments and shadow-only proposals. The API reports that checkpoint
+commands are disabled in shadow mode.
+
+The dashboard displays each task's model status, anomaly/inlier result, raw
+anomaly score, model version, and observation timestamp separately from its
+threshold-policy category and index. It accepts a prediction only when its
+task, bridge session, model version, and timestamp match the latest fresh
+telemetry; absent, stale, disconnected, or mismatched inference is shown as
+unavailable. The raw Isolation Forest score is not a calibrated failure
+probability, and shadow output cannot issue or suppress threshold-based
+checkpoint commands.
+
+There is no embedded dataset or trained embedded model shipped with the
+project. Until a compatible artifact is trained, the backend logs why ML
+inference is unavailable and continues using the unchanged threshold policy.
+The host Isolation Forest artifact is not compatible and must not be used for
+embedded inference. Model artifacts use joblib serialization and must come
+from a trusted local training run; do not load an untrusted artifact.
+
+Start the backend with the intended telemetry and model locations. The data
+directory is separate from host telemetry and checkpoint storage:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m twincoreos serve \
+  --workers 2 \
+  --memory-mib 8 \
+  --sample-interval 1 \
+  --checkpoint-interval 5 \
+  --checkpoint-budget-bytes 10485760 \
+  --checkpoint-dir .twincoreos/dashboard-checkpoints \
+  --embedded-stack-reserve-threshold-words 96 \
+  --embedded-data-dir .twincoreos/embedded-data \
+  --embedded-ml-model .twincoreos/models/embedded-isolation-forest.joblib \
+  --host 127.0.0.1 \
+  --port 8765
+```
+
+In another terminal, build/start the same firmware and bridge used by the
+embedded demo, without fault injection while collecting baseline samples:
+
+```sh
+export PATH="$HOME/.local/riscv/bin:$PATH"
+make -C embedded build
+PYTHONPATH=src .venv/bin/python -m twincoreos embedded-bridge
+```
+
+The bridge prints its `bridge_session_id` at startup. Collect a fresh,
+fault-free running baseline for both tasks, then stop only the bridge with
+Ctrl-C. Repeat the bridge session to obtain an independent source group. While
+each session is live, check that `/api/embedded/tasks` contains fresh samples
+for both tasks and that `/api/embedded/risk` reports the backend policy
+assessment. The shadow collector appends accepted non-duplicate records to
+`.twincoreos/embedded-data/live-observations.jsonl`; it never inserts
+test-generated records into that live journal.
+
+Inspect the journal, then explicitly curate each verified normal session
+(replace the two example session IDs with the values printed by the bridge):
+
+```sh
+PYTHONPATH=src .venv/bin/python -m twincoreos.embedded_ml inspect \
+  --input .twincoreos/embedded-data/live-observations.jsonl
+
+BASELINE_SESSION_1='paste-first-bridge-session-id'
+BASELINE_SESSION_2='paste-second-bridge-session-id'
+PYTHONPATH=src .venv/bin/python -m twincoreos.embedded_ml curate-baseline \
+  --input .twincoreos/embedded-data/live-observations.jsonl \
+  --output .twincoreos/embedded-data/baseline-session-1.jsonl \
+  --bridge-session-id "$BASELINE_SESSION_1" \
+  --threshold-words 96 \
+  --confirm-normal-baseline
+PYTHONPATH=src .venv/bin/python -m twincoreos.embedded_ml curate-baseline \
+  --input .twincoreos/embedded-data/live-observations.jsonl \
+  --output .twincoreos/embedded-data/baseline-session-2.jsonl \
+  --bridge-session-id "$BASELINE_SESSION_2" \
+  --threshold-words 96 \
+  --confirm-normal-baseline
+```
+
+Training requires at least 30 explicitly curated, fresh baseline records
+covering both tasks and at least two independent QEMU bridge sessions. If these
+checks fail, collect more data; do not lower the guard or add simulated data
+to the training inputs. The command creates a separate embedded model and
+refuses to overwrite it unless `--overwrite` is explicitly supplied:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m twincoreos.embedded_ml train \
+  --input .twincoreos/embedded-data/baseline-session-1.jsonl \
+  --input .twincoreos/embedded-data/baseline-session-2.jsonl \
+  --output .twincoreos/models/embedded-isolation-forest.joblib \
+  --contamination 0.05 \
+  --random-state 42
+```
+
+For a shadow evaluation, collect two further independent QEMU sessions not
+used for training (one validation source and a different held-out test
+source). After each session has fresh telemetry from both tasks, stop its
+bridge and generate explicitly marked operating-condition scenarios from
+that session only:
+
+```sh
+VALIDATION_SESSION='paste-validation-bridge-session-id'
+TEST_SESSION='paste-held-out-bridge-session-id'
+PYTHONPATH=src .venv/bin/python -m twincoreos.embedded_ml generate-scenarios \
+  --input .twincoreos/embedded-data/live-observations.jsonl \
+  --output .twincoreos/embedded-data/validation-scenarios.jsonl \
+  --bridge-session-id "$VALIDATION_SESSION" \
+  --threshold-words 96
+PYTHONPATH=src .venv/bin/python -m twincoreos.embedded_ml generate-scenarios \
+  --input .twincoreos/embedded-data/live-observations.jsonl \
+  --output .twincoreos/embedded-data/test-scenarios.jsonl \
+  --bridge-session-id "$TEST_SESSION" \
+  --threshold-words 96
+PYTHONPATH=src .venv/bin/python -m twincoreos.embedded_ml evaluate \
+  --model .twincoreos/models/embedded-isolation-forest.joblib \
+  --validation .twincoreos/embedded-data/validation-scenarios.jsonl \
+  --test .twincoreos/embedded-data/test-scenarios.jsonl \
+  --threshold-words 96
+```
+
+Evaluation rejects source-group overlap. Its reference conditions describe
+the explicitly simulated threshold, progress, and recovery operating
+conditions; they are not observed task failures, independent failure labels,
+or proof of real-world predictive performance. The output compares those
+conditions with both the existing threshold rule and the ML anomaly detector,
+and reports the limitations. After a compatible artifact is available, restart
+the backend with `--embedded-ml-model` pointing to it. `/api/embedded/ml`
+returns the loaded model version, current shadow assessments, differences
+from the threshold policy, journal status, and the explicit
+`checkpoint_command_issued: false` flag. No adaptive checkpointing or policy
+change is part of this stage.

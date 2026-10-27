@@ -268,66 +268,105 @@ class WorkerProcessIntegrationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, arguments)
             self.assertIn("error:", result.stderr, arguments)
 
+    def test_serve_reports_checkpoint_directory_startup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = os.path.join(directory, "not-a-directory")
+            with open(checkpoint_path, "w", encoding="utf-8") as checkpoint_file:
+                checkpoint_file.write("reserved")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "twincoreos",
+                    "serve",
+                    "--workers",
+                    "1",
+                    "--memory-mib",
+                    "1",
+                    "--checkpoint-dir",
+                    checkpoint_path,
+                    "--risk-model",
+                    os.path.join(directory, "missing-model.joblib"),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Could not initialize monitor runtime:", result.stderr)
+        self.assertIn("File exists:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def _run_with_signal(self, requested_signal: signal.Signals) -> None:
-        command = [
-            sys.executable,
-            "-m",
-            "twincoreos",
-            "monitor",
-            "--workers",
-            "2",
-            "--duration",
-            "30",
-            "--sample-interval",
-            "1",
-            "--memory-mib",
-            "1",
-        ]
-        monitor = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-        pids: set[int] = set()
-        try:
-            self.assertIsNotNone(monitor.stdout)
-            for _ in range(2):
-                line = monitor.stdout.readline()
-                self.assertTrue(line)
-                pids.add(json.loads(line)["pid"])
-            self.assertEqual(len(pids), 2)
+        with tempfile.TemporaryDirectory() as directory:
+            command = [
+                sys.executable,
+                "-m",
+                "twincoreos",
+                "monitor",
+                "--workers",
+                "2",
+                "--duration",
+                "30",
+                "--sample-interval",
+                "1",
+                "--memory-mib",
+                "1",
+                "--risk-model",
+                os.path.join(directory, "missing-model.joblib"),
+            ]
+            monitor = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            pids: set[int] = set()
+            try:
+                self.assertIsNotNone(monitor.stdout)
+                for _ in range(2):
+                    line = monitor.stdout.readline()
+                    self.assertTrue(line)
+                    pids.add(json.loads(line)["pid"])
+                self.assertEqual(len(pids), 2)
 
-            os.killpg(monitor.pid, requested_signal)
-            return_code = monitor.wait(timeout=8)
-            stderr = monitor.stderr.read() if monitor.stderr else ""
-            self.assertEqual(return_code, 130 if requested_signal == signal.SIGINT else 143)
-            if requested_signal == signal.SIGINT:
-                self.assertIn("Interrupted; stopping workers.", stderr)
+                os.killpg(monitor.pid, requested_signal)
+                return_code = monitor.wait(timeout=8)
+                stderr = monitor.stderr.read() if monitor.stderr else ""
+                self.assertEqual(
+                    return_code,
+                    130 if requested_signal == signal.SIGINT else 143,
+                )
+                if requested_signal == signal.SIGINT:
+                    self.assertIn("Interrupted; stopping workers.", stderr)
+                else:
+                    self.assertIn(
+                        "ML risk model unavailable; using baseline predictor",
+                        stderr,
+                    )
                 self.assertNotIn("Traceback", stderr)
-            else:
-                self.assertEqual(stderr, "")
 
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline and any(
-                psutil.pid_exists(pid) for pid in pids
-            ):
-                time.sleep(0.02)
-            self.assertFalse([pid for pid in pids if psutil.pid_exists(pid)])
-        finally:
-            if monitor.poll() is None:
-                os.killpg(monitor.pid, signal.SIGKILL)
-                monitor.wait()
-            if monitor.stdout is not None:
-                monitor.stdout.close()
-            if monitor.stderr is not None:
-                monitor.stderr.close()
-            for pid in pids:
-                try:
-                    psutil.Process(pid).kill()
-                except psutil.NoSuchProcess:
-                    pass
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and any(
+                    psutil.pid_exists(pid) for pid in pids
+                ):
+                    time.sleep(0.02)
+                self.assertFalse([pid for pid in pids if psutil.pid_exists(pid)])
+            finally:
+                if monitor.poll() is None:
+                    os.killpg(monitor.pid, signal.SIGKILL)
+                    monitor.wait()
+                if monitor.stdout is not None:
+                    monitor.stdout.close()
+                if monitor.stderr is not None:
+                    monitor.stderr.close()
+                for pid in pids:
+                    try:
+                        psutil.Process(pid).kill()
+                    except psutil.NoSuchProcess:
+                        pass
 
     def test_sigint_cleans_up_workers_without_traceback(self) -> None:
         self._run_with_signal(signal.SIGINT)

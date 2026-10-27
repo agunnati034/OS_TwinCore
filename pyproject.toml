@@ -10,11 +10,13 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "psutil>=5.9",
+    "scikit-learn>=1.3,<2",
 ]
 
 [project.scripts]
 twincoreos = "twincoreos.cli:main"
+twincoreos-train-risk-model = "twincoreos.train_risk_model:main"
+twincoreos-embedded-ml = "twincoreos.embedded_ml:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

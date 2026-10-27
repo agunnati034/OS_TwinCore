@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import sys
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from twincoreos.embedded_telemetry import EmbeddedTelemetryError
 from twincoreos.runtime import (
+    EmbeddedFaultRequestError,
     EmbeddedTelemetryConflictError,
     EmbeddedTelemetryOutOfOrderError,
     MonitorRuntime,
@@ -34,6 +36,12 @@ class TwinCoreRequestHandler(BaseHTTPRequestHandler):
         "http://127.0.0.1:5173",
         "http://localhost:5173",
     }
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except ConnectionError:
+            self.close_connection = True
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -122,9 +130,18 @@ class TwinCoreRequestHandler(BaseHTTPRequestHandler):
                     "embedded_checkpoint_status": snapshot[
                         "embedded_checkpoint_status"
                     ],
+                    "embedded_checkpoint_storage": snapshot[
+                        "embedded_checkpoint_storage"
+                    ],
+                    "embedded_fault_injection": snapshot[
+                        "embedded_fault_injection"
+                    ],
+                    "embedded_fault_runs": snapshot["embedded_fault_runs"],
                     "embedded_risk_assessments": snapshot[
                         "embedded_risk_assessments"
                     ],
+                    "embedded_risk_events": snapshot["embedded_risk_events"],
+                    "embedded_ml": snapshot["embedded_ml"],
                 },
             )
         elif path in {"/api", "/api/status"}:
@@ -188,11 +205,54 @@ class TwinCoreRequestHandler(BaseHTTPRequestHandler):
                     "assessments": snapshot["embedded_risk_assessments"],
                 },
             )
+        elif path == "/api/embedded/ml":
+            self._send_json(200, snapshot["embedded_ml"])
+        elif path == "/api/embedded/fault-injection":
+            self._send_json(
+                200,
+                {
+                    "request": snapshot["embedded_fault_injection"],
+                    "runs": snapshot["embedded_fault_runs"],
+                    "assessments": snapshot["embedded_risk_assessments"],
+                },
+            )
+        elif path == "/api/embedded/bridge/command":
+            try:
+                values = parse_qs(parsed.query, strict_parsing=True)
+                if set(values) != {"bridge_session_id"}:
+                    raise ValueError(
+                        "bridge_session_id is the only supported query parameter"
+                    )
+                bridge_session_id = values["bridge_session_id"][0]
+                result = self.server.runtime.take_embedded_uart_command(
+                    bridge_session_id
+                )
+                self._send_json(200, {"command": result})
+            except (EmbeddedFaultRequestError, ValueError) as error:
+                self._send_json(400, {"error": str(error)})
         else:
             self._send_json(404, {"error": "endpoint not found"})
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
+        if path == "/api/embedded/fault-injection":
+            try:
+                body = self._body()
+                if set(body) != {"task_id", "confirm"} or body["confirm"] is not True:
+                    raise ValueError(
+                        'request must contain {"task_id": "sensor-sampler", "confirm": true}'
+                    )
+                request = self.server.runtime.request_embedded_fault(
+                    body["task_id"]
+                )
+                self._send_json(202, {"success": True, "request": request})
+            except EmbeddedFaultRequestError as error:
+                self._send_json(409, {"success": False, "error": str(error)})
+            except RuntimeUnavailableError as error:
+                self._send_json(503, {"success": False, "error": str(error)})
+            except ValueError as error:
+                self._send_json(400, {"success": False, "error": str(error)})
+            return
         if path == "/api/embedded/telemetry":
             try:
                 body = self._body()
@@ -284,6 +344,13 @@ def serve(
     server: TwinCoreHTTPServer | None = None
     try:
         server = create_server(runtime, host, port)
+        bound_host, bound_port = server.server_address[:2]
+        display_host = f"[{bound_host}]" if ":" in bound_host else bound_host
+        print(
+            f"TwinCoreOS API listening on http://{display_host}:{bound_port}",
+            file=sys.stderr,
+            flush=True,
+        )
         server.timeout = 0.25
         while stop_requested is None or not stop_requested():
             server.handle_request()

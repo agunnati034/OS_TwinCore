@@ -16,7 +16,10 @@ import psutil
 
 from twincoreos.digital_twin import DigitalTwinEngine
 from twincoreos.checkpoint_manager import CheckpointError, CheckpointManager
-from twincoreos.risk_predictor import BaselineRiskPredictor
+from twincoreos.ml_risk_predictor import (
+    DEFAULT_MODEL_PATH,
+    create_risk_predictor,
+)
 
 
 class WorkerStartupError(RuntimeError):
@@ -647,12 +650,18 @@ def monitor(
     checkpoint_budget_bytes: int = 10 * 1024 * 1024,
     checkpoint_dir: str | Path = ".twincoreos/checkpoints",
     fault_worker_id: str | None = None,
+    risk_model_path: str | Path = DEFAULT_MODEL_PATH,
+    normal_risk_score: float = 0.0,
+    anomaly_risk_score: float = 0.60,
 ) -> None:
     twin_engine = DigitalTwinEngine(
         stale_after_seconds=max(3.0 * sample_interval, sample_interval + 0.001)
     )
-    risk_predictor = BaselineRiskPredictor(
-        assessment_validity_seconds=max(3.0 * sample_interval, sample_interval + 0.001)
+    risk_predictor = create_risk_predictor(
+        risk_model_path,
+        assessment_validity_seconds=max(3.0 * sample_interval, sample_interval + 0.001),
+        normal_risk_score=normal_risk_score,
+        anomaly_risk_score=anomaly_risk_score,
     )
     checkpoint_manager = CheckpointManager(
         checkpoint_dir,

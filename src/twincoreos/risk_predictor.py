@@ -16,6 +16,7 @@ from twincoreos.digital_twin import HealthState, TwinState
 
 
 class RiskCategory(str, Enum):
+    WARMING_UP = "WARMING_UP"
     LOW = "LOW"
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
@@ -90,7 +91,7 @@ class RiskThresholds:
 class RiskAssessment:
     worker_id: str
     pid: int
-    risk_score: float
+    risk_score: float | None
     risk_category: RiskCategory
     observed_features: dict[str, Any]
     explanation: str
@@ -125,6 +126,26 @@ class RiskAssessment:
         return current.astimezone(timezone.utc) <= datetime.fromisoformat(
             self.valid_until_utc
         )
+
+
+def mark_risk_assessment_warming_up(
+    assessment: RiskAssessment,
+) -> RiskAssessment:
+    assessment.risk_score = None
+    assessment.risk_category = RiskCategory.WARMING_UP
+    assessment.observed_features["model_type"] = "warming_up"
+    assessment.observed_features["risk_score_semantics"] = (
+        "unavailable until at least two telemetry samples are observed"
+    )
+    assessment.explanation = (
+        "Risk assessment is warming up; at least two telemetry samples are "
+        "required to assess per-worker trends."
+    )
+    assessment.category_changed = (
+        assessment.previous_category is not None
+        and assessment.previous_category != RiskCategory.WARMING_UP
+    )
+    return assessment
 
 
 class RiskPredictor:
@@ -253,6 +274,9 @@ class BaselineRiskPredictor(RiskPredictor):
             "previous_process_status": previous_status,
             "process_state_changed": process_state_changed,
             "observed_worker_failure": twin.health_state == HealthState.FAILED,
+            "risk_score_semantics": (
+                "baseline heuristic index from 0 to 1; not a failure probability"
+            ),
         }
 
         score = 0.0

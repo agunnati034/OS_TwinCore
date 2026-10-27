@@ -11,7 +11,7 @@ import subprocess
 import sys
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 import uuid
 
@@ -20,26 +20,33 @@ TARGET = "freertos-qemu-rv32"
 SCHEMA_VERSION = 1
 CHECKPOINT_MAGIC = 0x54434F53
 CHECKPOINT_SCHEMA_VERSION = 1
-CHECKPOINT_TASK_ID = 1
 MAX_UART_LINE_BYTES = 4096
 TASK_STATES = {"running", "ready", "blocked", "suspended", "deleted"}
+TASK_IDS = {"sensor-sampler", "control-loop"}
+TASK_CHECKPOINT_IDS = {"sensor-sampler": 1}
 TASK_EVENTS = {
     "checkpoint_requested",
     "checkpoint_saved",
     "checkpoint_failed",
     "task_restart_started",
     "task_restarted",
+    "restore_started",
     "restore_succeeded",
     "restore_failed",
     "task_progress",
     "recovery_completed",
     "recovery_failed",
+    "fault_injection_requested",
+    "fault_injected",
 }
 TASK_EVENT_STATE_FIELDS = {"counter", "accumulator", "integrity_hash"}
+TASK_EVENT_CHECKPOINT_FIELDS = {"checkpoint_size_bytes"}
+RUN_ID_FIELD = "run_id"
 CHECKPOINT_SUCCESS_EVENTS = {
     "checkpoint_saved",
     "task_restart_started",
     "task_restarted",
+    "restore_started",
     "restore_succeeded",
 }
 
@@ -52,18 +59,36 @@ class EmbeddedBridgeError(RuntimeError):
     """The QEMU UART bridge could not deliver or maintain its stream."""
 
 
-def _checkpoint_integrity_hash(counter: int, accumulator: int) -> int:
+def _checkpoint_integrity_hash(
+    counter: int, accumulator: int, task_id: str = "sensor-sampler"
+) -> int:
+    checkpoint_task_id = TASK_CHECKPOINT_IDS.get(task_id)
+    if checkpoint_task_id is None:
+        raise EmbeddedTelemetryError("checkpoint task identity is unsupported")
     result = 2166136261
     for value in (
         CHECKPOINT_MAGIC,
         CHECKPOINT_SCHEMA_VERSION,
-        CHECKPOINT_TASK_ID,
+        checkpoint_task_id,
         counter,
         accumulator,
     ):
         for byte in value.to_bytes(4, "little"):
             result = ((result ^ byte) * 16777619) & 0xFFFFFFFF
     return result
+
+
+def _validate_run_id(value: object) -> str:
+    if not isinstance(value, str):
+        raise EmbeddedTelemetryError("run_id must be a canonical UUID string")
+    try:
+        if str(uuid.UUID(value)) != value:
+            raise ValueError("UUID must use canonical form")
+    except ValueError as error:
+        raise EmbeddedTelemetryError(
+            "run_id must be a canonical UUID string"
+        ) from error
+    return value
 
 
 def validate_task_telemetry(value: object) -> dict[str, Any]:
@@ -79,12 +104,15 @@ def validate_task_telemetry(value: object) -> dict[str, Any]:
         "execution_count",
         "stack_high_water_mark_words",
     }
-    if set(value) != expected:
-        missing = sorted(expected - set(value))
-        extra = sorted(set(value) - expected)
+    fields = set(value)
+    if not expected <= fields or fields - expected - {RUN_ID_FIELD}:
+        missing = sorted(expected - fields)
+        extra = sorted(fields - expected - {RUN_ID_FIELD})
         raise EmbeddedTelemetryError(
             f"telemetry fields do not match schema v1 (missing={missing}, extra={extra})"
         )
+    if RUN_ID_FIELD in value:
+        _validate_run_id(value[RUN_ID_FIELD])
     if (
         not isinstance(value["schema_version"], int)
         or isinstance(value["schema_version"], bool)
@@ -130,15 +158,34 @@ def validate_task_event(value: object) -> dict[str, Any]:
         "event",
     }
     fields = frozenset(value)
-    if fields not in {
-        frozenset(required),
-        frozenset(required | TASK_EVENT_STATE_FIELDS),
-    }:
+    allowed = (
+        required
+        | TASK_EVENT_STATE_FIELDS
+        | TASK_EVENT_CHECKPOINT_FIELDS
+        | {RUN_ID_FIELD}
+    )
+    if not required <= fields or fields - allowed or (
+        (
+            fields
+            - {RUN_ID_FIELD}
+            - TASK_EVENT_CHECKPOINT_FIELDS
+        )
+        not in {
+            frozenset(required),
+            frozenset(required | TASK_EVENT_STATE_FIELDS),
+        }
+        or (
+            TASK_EVENT_CHECKPOINT_FIELDS & fields
+            and value["event"] != "checkpoint_saved"
+        )
+    ):
         missing = sorted(required - set(fields))
-        extra = sorted(set(fields) - (required | TASK_EVENT_STATE_FIELDS))
+        extra = sorted(set(fields) - allowed)
         raise EmbeddedTelemetryError(
             f"task event fields do not match schema v1 (missing={missing}, extra={extra})"
         )
+    if RUN_ID_FIELD in value:
+        _validate_run_id(value[RUN_ID_FIELD])
     if (
         not isinstance(value["schema_version"], int)
         or isinstance(value["schema_version"], bool)
@@ -147,10 +194,23 @@ def validate_task_event(value: object) -> dict[str, Any]:
         raise EmbeddedTelemetryError("unsupported task event schema_version")
     if value["message_type"] != "task_event" or value["target"] != TARGET:
         raise EmbeddedTelemetryError("task event message_type or target is invalid")
-    if value["task_id"] != "sensor-sampler":
-        raise EmbeddedTelemetryError("task event task_id must be sensor-sampler")
+    if (
+        not isinstance(value["task_id"], str)
+        or value["task_id"] not in TASK_IDS
+    ):
+        raise EmbeddedTelemetryError("task event task_id is unsupported")
     if not isinstance(value["event"], str) or value["event"] not in TASK_EVENTS:
         raise EmbeddedTelemetryError("task event name is not supported")
+    if value["event"] == "checkpoint_saved":
+        size = value.get("checkpoint_size_bytes")
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or not 1 <= size <= 1024
+        ):
+            raise EmbeddedTelemetryError(
+                "checkpoint_saved requires a valid checkpoint_size_bytes"
+            )
     if "counter" in value:
         for field in TASK_EVENT_STATE_FIELDS:
             item = value[field]
@@ -167,7 +227,9 @@ def validate_task_event(value: object) -> dict[str, Any]:
     if (
         value["event"] in CHECKPOINT_SUCCESS_EVENTS
         and value["integrity_hash"]
-        != _checkpoint_integrity_hash(value["counter"], value["accumulator"])
+        != _checkpoint_integrity_hash(
+            value["counter"], value["accumulator"], value["task_id"]
+        )
     ):
         raise EmbeddedTelemetryError(
             f"{value['event']} checkpoint integrity hash does not match its state"
@@ -245,7 +307,7 @@ def _post_task_event(
     bridge_session_id: str,
     record: dict[str, Any],
     opener: Callable[..., Any] = urlopen,
-) -> None:
+) -> dict[str, Any]:
     payload = json.dumps(
         {"bridge_session_id": bridge_session_id, "event": record},
         separators=(",", ":"),
@@ -275,6 +337,7 @@ def _post_task_event(
         raise EmbeddedBridgeError(f"could not deliver embedded event: {error}") from error
     if not isinstance(result, dict) or result.get("success") is not True:
         raise EmbeddedBridgeError("backend returned an unsuccessful event response")
+    return result
 
 
 def _get_embedded_risk(
@@ -307,8 +370,56 @@ def _get_embedded_risk(
     return result
 
 
+def _get_embedded_uart_command(
+    endpoint: str,
+    bridge_session_id: str,
+    opener: Callable[..., Any] = urlopen,
+) -> dict[str, str] | None:
+    request = Request(
+        f"{endpoint}?{urlencode({'bridge_session_id': bridge_session_id})}",
+        headers={"Accept": "application/json"},
+    )
+    try:
+        with opener(request, timeout=3) as response:
+            result = json.loads(response.read())
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        error.close()
+        raise EmbeddedBridgeError(
+            f"could not poll embedded UART commands: HTTP {error.code}: {detail}"
+        ) from error
+    except (
+        URLError,
+        TimeoutError,
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise EmbeddedBridgeError(
+            f"could not poll embedded UART commands: {error}"
+        ) from error
+    if not isinstance(result, dict):
+        raise EmbeddedBridgeError("backend returned an invalid UART command response")
+    command = result.get("command")
+    if command is None:
+        return None
+    if (
+        not isinstance(command, dict)
+        or set(command) != {"request_id", "run_id", "command"}
+        or not isinstance(command["request_id"], str)
+        or command["request_id"] != command["run_id"]
+        or command["command"]
+        != f"INJECT_STACK_PRESSURE sensor-sampler {command['run_id']}"
+    ):
+        raise EmbeddedBridgeError("backend returned an unsupported UART command")
+    _validate_run_id(command["run_id"])
+    return command
+
+
 def _assessment_recommends_checkpoint(
-    response: dict[str, Any], task_id: str = "sensor-sampler"
+    response: dict[str, Any],
+    task_id: str = "sensor-sampler",
+    run_id: str | None = None,
 ) -> bool:
     if response.get("assessment_type") != "heuristic_operational_risk":
         return False
@@ -331,6 +442,9 @@ def _assessment_recommends_checkpoint(
             return False
         stack_words = observed.get("stack_high_water_mark_words")
         age = observed.get("telemetry_age_seconds")
+        observed_run_id = observed.get(RUN_ID_FIELD)
+        if run_id is not None and observed_run_id != run_id:
+            return False
         minimum = configuration.get("minimum_stack_high_water_words")
         stale_after = configuration.get("stale_after_seconds")
         return (
@@ -384,6 +498,13 @@ def _assessment_is_normal_and_fresh(
         age = observed.get("telemetry_age_seconds")
         minimum = configuration.get("minimum_stack_high_water_words")
         stale_after = configuration.get("stale_after_seconds")
+        if (
+            not isinstance(stale_after, (int, float))
+            or isinstance(stale_after, bool)
+            or not math.isfinite(stale_after)
+            or stale_after <= 0
+        ):
+            return False
         return (
             observed.get("task_state") == "running"
             and isinstance(stack_words, int)
@@ -408,27 +529,57 @@ class EmbeddedCheckpointGate:
     """Latch policy requests until the condition clears and a later cycle is eligible."""
 
     def __init__(self) -> None:
-        self.armed = True
-        self.pending = False
-        self.waiting_for_clear = False
+        self._states: dict[tuple[str, str | None], dict[str, bool]] = {}
+
+    def _state(
+        self, task_id: str, run_id: str | None
+    ) -> dict[str, bool]:
+        return self._states.setdefault(
+            (task_id, run_id),
+            {"armed": True, "pending": False, "waiting_for_clear": False},
+        )
 
     def observe_event(self, event: dict[str, Any]) -> None:
         name = event.get("event")
+        task_id = event.get("task_id", "sensor-sampler")
+        if not isinstance(task_id, str) or task_id not in TASK_CHECKPOINT_IDS:
+            return
+        run_id = event.get(RUN_ID_FIELD)
+        if run_id is not None and not isinstance(run_id, str):
+            return
+        state = self._state(task_id, run_id)
         if name == "checkpoint_requested":
-            self.pending = True
+            state["pending"] = True
         elif name in {"checkpoint_saved", "checkpoint_failed"}:
-            self.pending = False
-            self.waiting_for_clear = True
-            self.armed = False
+            state["pending"] = False
+            state["waiting_for_clear"] = True
+            state["armed"] = False
 
-    def should_request(self, response: dict[str, Any]) -> bool:
-        recommends = _assessment_recommends_checkpoint(response)
-        if self.waiting_for_clear and _assessment_is_normal_and_fresh(response):
-            self.armed = True
-            self.waiting_for_clear = False
-        if recommends and self.armed and not self.pending:
-            self.pending = True
-            self.armed = False
+    def should_request(
+        self,
+        response: dict[str, Any],
+        task_id: str = "sensor-sampler",
+        run_id: str | None = None,
+    ) -> bool:
+        if not isinstance(task_id, str) or task_id not in TASK_CHECKPOINT_IDS:
+            return False
+        if run_id is None:
+            for assessment in response.get("assessments", []):
+                if isinstance(assessment, dict) and assessment.get("task_id") == task_id:
+                    observed = assessment.get("observed_inputs")
+                    if isinstance(observed, dict) and isinstance(observed.get(RUN_ID_FIELD), str):
+                        run_id = observed[RUN_ID_FIELD]
+                    break
+        state = self._state(task_id, run_id)
+        recommends = _assessment_recommends_checkpoint(response, task_id)
+        if state["waiting_for_clear"] and _assessment_is_normal_and_fresh(
+            response, task_id
+        ):
+            state["armed"] = True
+            state["waiting_for_clear"] = False
+        if recommends and state["armed"] and not state["pending"]:
+            state["pending"] = True
+            state["armed"] = False
             return True
         return False
 
@@ -438,6 +589,7 @@ def run_bridge(
     api_url: str,
     qemu: str = "qemu-system-riscv32",
     shutdown_timeout: float = 5.0,
+    inject_stack_pressure_task: str | None = None,
     stop_requested: Callable[[], bool] | None = None,
     opener: Callable[..., Any] = urlopen,
 ) -> int:
@@ -449,6 +601,10 @@ def run_bridge(
         raise EmbeddedBridgeError("api_url must be an absolute HTTP(S) URL")
     if not math.isfinite(shutdown_timeout) or shutdown_timeout <= 0:
         raise EmbeddedBridgeError("shutdown_timeout must be a positive finite value")
+    if inject_stack_pressure_task not in {None, "sensor-sampler"}:
+        raise EmbeddedBridgeError(
+            "stack-pressure injection is supported only for sensor-sampler"
+        )
 
     command = [
         qemu,
@@ -488,10 +644,16 @@ def run_bridge(
     endpoint_root = telemetry_url.path[: -len("/telemetry")]
     risk_url = telemetry_url._replace(path=f"{endpoint_root}/risk").geturl()
     event_url = telemetry_url._replace(path=f"{endpoint_root}/events").geturl()
+    command_url = telemetry_url._replace(
+        path=f"{endpoint_root}/bridge/command"
+    ).geturl()
     selector = selectors.DefaultSelector()
     buffer = bytearray()
     dropping_oversized_line = False
     checkpoint_gate = EmbeddedCheckpointGate()
+    initial_task_ids: set[str] = set()
+    fault_injection_sent = False
+    cli_run_id = str(uuid.uuid4())
     try:
         file_descriptor = process.stdout.fileno()
         os.set_blocking(file_descriptor, False)
@@ -531,7 +693,18 @@ def run_bridge(
                 if record is None:
                     continue
                 if record.get("message_type") == "task_event":
-                    _post_task_event(event_url, session_id, record, opener)
+                    accepted_event = _post_task_event(
+                        event_url, session_id, record, opener
+                    )
+                    if accepted_event.get("accepted") is False:
+                        print(
+                            "Ignoring stale embedded event "
+                            f"{record['event']} task={record['task_id']} "
+                            f"run_id={record.get(RUN_ID_FIELD)}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
                     event_name = record["event"]
                     print(
                         f"Embedded event {event_name} task={record['task_id']}",
@@ -542,6 +715,14 @@ def run_bridge(
                     continue
 
                 result = _post_telemetry(api_url, session_id, record, opener)
+                if result.get("accepted") is False:
+                    print(
+                        "Ignoring stale embedded telemetry "
+                        f"task={record['task_id']} run_id={record.get(RUN_ID_FIELD)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
                 if result.get("duplicate") is True:
                     print(
                         f"Duplicate ignored: {record['task_id']} execution={record['execution_count']}",
@@ -556,19 +737,85 @@ def run_bridge(
                         flush=True,
                     )
                 risk = _get_embedded_risk(risk_url, opener)
-                if (
-                    record["task_id"] == "sensor-sampler"
-                    and checkpoint_gate.should_request(risk)
-                ):
+                initial_task_ids.add(record["task_id"])
+                uart_command = _get_embedded_uart_command(
+                    command_url, session_id, opener
+                )
+                if uart_command is not None:
                     try:
-                        process.stdin.write(b"CHECKPOINT sensor-sampler\n")
+                        process.stdin.write(
+                            f"{uart_command['command']}\n".encode("ascii")
+                        )
+                        process.stdin.flush()
+                    except (BrokenPipeError, OSError) as error:
+                        raise EmbeddedBridgeError(
+                            "could not send dashboard-requested embedded fault "
+                            f"over QEMU UART: {error}"
+                        ) from error
+                    fault_injection_sent = True
+                    print(
+                        "UART embedded fault command dispatched from dashboard "
+                        f"request run_id={uart_command['run_id']}: "
+                        f"{uart_command['command']}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                if (
+                    inject_stack_pressure_task is not None
+                    and not fault_injection_sent
+                    and initial_task_ids >= {"sensor-sampler", "control-loop"}
+                    and _assessments_are_normal_and_fresh(risk)
+                ):
+                    initial_assessments = risk["assessments"]
+                    for assessment in initial_assessments:
+                        inputs = assessment["observed_inputs"]
+                        print(
+                            "Initial embedded assessment "
+                            f"task={assessment['task_id']} "
+                            f"risk={assessment['risk_category']} "
+                            f"stack={inputs['stack_high_water_mark_words']} words",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    command = (
+                        f"INJECT_STACK_PRESSURE {inject_stack_pressure_task} "
+                        f"{cli_run_id}\n"
+                    ).encode("ascii")
+                    try:
+                        process.stdin.write(command)
+                        process.stdin.flush()
+                    except (BrokenPipeError, OSError) as error:
+                        raise EmbeddedBridgeError(
+                            f"could not send stack-pressure injection over QEMU UART: {error}"
+                        ) from error
+                    fault_injection_sent = True
+                    print(
+                        "UART fault injection sent: bounded stack pressure "
+                        f"task={inject_stack_pressure_task}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                if (
+                    checkpoint_gate.should_request(
+                        risk,
+                        record["task_id"],
+                        record.get(RUN_ID_FIELD),
+                    )
+                ):
+                    task_run_id = record.get(RUN_ID_FIELD)
+                    suffix = f" {task_run_id}" if task_run_id is not None else ""
+                    command = f"CHECKPOINT {record['task_id']}{suffix}\n".encode(
+                        "ascii"
+                    )
+                    try:
+                        process.stdin.write(command)
                         process.stdin.flush()
                     except (BrokenPipeError, OSError) as error:
                         raise EmbeddedBridgeError(
                             f"could not send checkpoint request over QEMU UART: {error}"
                         ) from error
                     print(
-                        "UART checkpoint command sent for sensor-sampler after embedded policy recommendation",
+                        f"UART checkpoint command sent for {record['task_id']} after embedded policy recommendation",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -595,3 +842,57 @@ def run_bridge(
                 process.wait(timeout=shutdown_timeout)
         process.stdout.close()
         process.stdin.close()
+
+
+def _assessments_are_normal_and_fresh(response: dict[str, Any]) -> bool:
+    if response.get("assessment_type") != "heuristic_operational_risk":
+        return False
+    assessments = response.get("assessments")
+    if not isinstance(assessments, list):
+        return False
+    by_task = {
+        assessment.get("task_id"): assessment
+        for assessment in assessments
+        if isinstance(assessment, dict)
+    }
+    return all(
+        _assessment_entry_is_normal_and_fresh(by_task, task_id)
+        for task_id in ("sensor-sampler", "control-loop")
+    )
+
+
+def _assessment_entry_is_normal_and_fresh(
+    assessments: dict[str, dict[str, Any]], task_id: str
+) -> bool:
+    assessment = assessments.get(task_id)
+    if assessment is None:
+        return False
+    observed = assessment.get("observed_inputs")
+    configuration = assessment.get("policy_configuration")
+    if (
+        assessment.get("assessment_type") != "heuristic_operational_risk"
+        or assessment.get("policy_id") != "embedded-stack-reserve-v1"
+        or assessment.get("target") != TARGET
+        or assessment.get("risk_level") != "normal"
+        or assessment.get("recommendation") != "none"
+        or assessment.get("matched_rules") != []
+        or not isinstance(observed, dict)
+        or not isinstance(configuration, dict)
+    ):
+        return False
+    stack_words = observed.get("stack_high_water_mark_words")
+    age = observed.get("telemetry_age_seconds")
+    minimum = configuration.get("minimum_stack_high_water_words")
+    stale_after = configuration.get("stale_after_seconds")
+    return (
+        observed.get("task_state") == "running"
+        and isinstance(stack_words, int)
+        and not isinstance(stack_words, bool)
+        and isinstance(minimum, int)
+        and not isinstance(minimum, bool)
+        and stack_words > minimum
+        and isinstance(age, (int, float))
+        and not isinstance(age, bool)
+        and math.isfinite(age)
+        and 0 <= age <= stale_after
+    )

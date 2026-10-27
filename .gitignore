@@ -11,7 +11,21 @@ frontend/node_modules/
 frontend/dist/
 .DS_Store
 *.log
+.twincoreos/models/
+.twincoreos/host-telemetry.jsonl
+.twincoreos/embedded-data/
 
 # Generated build artifacts
 build/
 *.egg-info/
+
+# Runtime checkpoint and audit data
+.twincoreos/checkpoints/
+.twincoreos/dashboard-checkpoints/
+.twincoreos/audit-demo-checkpoints/
+
+# Generated TypeScript build information
+frontend/tsconfig.tsbuildinfo
+
+# Local Python executable/artifact
+/python3.14

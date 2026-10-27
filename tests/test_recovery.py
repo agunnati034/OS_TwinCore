@@ -12,8 +12,10 @@ import psutil
 
 from twincoreos.checkpoint_manager import CheckpointManager
 from twincoreos.digital_twin import DigitalTwinEngine, HealthState
+from twincoreos.ml_risk_predictor import IsolationForestRiskPredictor
 from twincoreos.monitor import WorkerPool
 from twincoreos.recovery import RecoveryCoordinator, RecoveryError
+from twincoreos.risk_predictor import RiskCategory
 
 
 def _observation(worker_id: str, pid: int) -> dict[str, object]:
@@ -27,6 +29,11 @@ def _observation(worker_id: str, pid: int) -> dict[str, object]:
         "process_status": psutil.STATUS_RUNNING,
         "measurement_errors": {},
     }
+
+
+class _AlwaysAnomalousModel:
+    def decision_function(self, _features: list[list[float]]) -> list[float]:
+        return [-1.0]
 
 
 class RecoveryIntegrationTests(unittest.TestCase):
@@ -105,6 +112,27 @@ class RecoveryIntegrationTests(unittest.TestCase):
             self.twins.get(self.target.task_id).health_state, HealthState.HEALTHY
         )
         self.assertEqual(coordinator.drain_events()[-1]["event"], "recovery_failed")
+
+    def test_high_ml_anomaly_does_not_bypass_checkpoint_validation(self) -> None:
+        target_twin = self.twins.get(self.target.task_id)
+        self.twins.update(
+            _observation(self.target.task_id, self.target.child.pid),
+            observed_at_monotonic=target_twin.observed_at_monotonic + 1,
+        )
+        assessment = IsolationForestRiskPredictor(
+            _AlwaysAnomalousModel(),
+            anomaly_risk_score=0.6,
+        ).assess(target_twin)
+        self.assertEqual(assessment.risk_category, RiskCategory.HIGH)
+
+        coordinator = RecoveryCoordinator(self.pool, self.twins, self.manager)
+        with self.assertRaisesRegex(RecoveryError, "no valid checkpoint"):
+            coordinator.recover(self.target.task_id)
+        self.assertTrue(psutil.pid_exists(self.target.child.pid))
+        self.assertEqual(
+            self.manager.list_checkpoints(),
+            [],
+        )
 
     def test_corrupt_checkpoint_is_rejected_without_replacement(self) -> None:
         checkpoint = self._checkpoint_target()

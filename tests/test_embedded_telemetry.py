@@ -61,6 +61,7 @@ class EmbeddedTelemetryTests(unittest.TestCase):
             "counter": 4,
             "accumulator": 2089706401,
             "integrity_hash": 3568767710,
+            "checkpoint_size_bytes": 24,
         }
         line = (json.dumps(event, separators=(",", ":")) + "\n").encode()
         self.assertEqual(validate_task_event(event), event)
@@ -71,7 +72,11 @@ class EmbeddedTelemetryTests(unittest.TestCase):
         gate = EmbeddedCheckpointGate()
 
         def response(
-            risk_level: str, recommendation: str, stack_words: int, rules: list[str]
+            risk_level: str,
+            recommendation: str,
+            stack_words: int,
+            rules: list[str],
+            task_id: str = "sensor-sampler",
         ) -> dict[str, object]:
             return {
                 "assessment_type": "heuristic_operational_risk",
@@ -79,7 +84,7 @@ class EmbeddedTelemetryTests(unittest.TestCase):
                     "assessment_type": "heuristic_operational_risk",
                     "policy_id": "embedded-stack-reserve-v1",
                     "target": "freertos-qemu-rv32",
-                    "task_id": "sensor-sampler",
+                    "task_id": task_id,
                     "risk_level": risk_level,
                     "recommendation": recommendation,
                     "matched_rules": rules,
@@ -108,6 +113,18 @@ class EmbeddedTelemetryTests(unittest.TestCase):
         self.assertFalse(gate.should_request(elevated))
         self.assertFalse(gate.should_request(normal))
         self.assertTrue(gate.should_request(elevated))
+
+        control_elevated = response(
+            "elevated",
+            "checkpoint_recommended",
+            16,
+            ["stack_high_water_at_or_below_configured_minimum"],
+            task_id="control-loop",
+        )
+        self.assertFalse(gate.should_request(control_elevated, "control-loop"))
+        self.assertFalse(gate.should_request(elevated))
+        self.assertFalse(gate.should_request(elevated, "unsupported-task"))
+        gate.observe_event({"task_id": [], "event": "checkpoint_saved"})
 
     def test_checkpoint_policy_gate_fails_closed_and_latches_failure(self) -> None:
         gate = EmbeddedCheckpointGate()
@@ -174,12 +191,13 @@ class EmbeddedTelemetryTests(unittest.TestCase):
             "counter": 4,
             "accumulator": 2089706401,
             "integrity_hash": 3568767710,
+            "checkpoint_size_bytes": 24,
         }
         invalid_events = [
             {key: value for key, value in base.items() if key != "integrity_hash"},
             {**base, "integrity_hash": base["integrity_hash"] ^ 1},
             {**base, "event": "unrecognized"},
-            {**base, "task_id": "control-loop"},
+            {**base, "task_id": "worker-1"},
             {**base, "counter": True},
             {**base, "extra": "not in schema"},
             {
@@ -191,6 +209,80 @@ class EmbeddedTelemetryTests(unittest.TestCase):
         for event in invalid_events:
             with self.subTest(event=event), self.assertRaises(EmbeddedTelemetryError):
                 validate_task_event(event)
+
+    def test_checkpoint_saved_requires_valid_firmware_record_size(self) -> None:
+        base = {
+            "schema_version": 1,
+            "message_type": "task_event",
+            "target": "freertos-qemu-rv32",
+            "task_id": "sensor-sampler",
+            "event": "checkpoint_saved",
+            "counter": 4,
+            "accumulator": 2089706401,
+            "integrity_hash": 3568767710,
+            "checkpoint_size_bytes": 24,
+        }
+        for invalid_size in (None, True, 0, -1, 1025, 1.5):
+            with self.subTest(size=invalid_size), self.assertRaisesRegex(
+                EmbeddedTelemetryError, "checkpoint_saved requires"
+            ):
+                validate_task_event({**base, "checkpoint_size_bytes": invalid_size})
+        missing_size = {
+            key: value for key, value in base.items() if key != "checkpoint_size_bytes"
+        }
+        with self.assertRaisesRegex(
+            EmbeddedTelemetryError, "checkpoint_saved requires"
+        ):
+            validate_task_event(missing_size)
+
+    def test_non_checkpoint_event_rejects_checkpoint_size(self) -> None:
+        event = {
+            "schema_version": 1,
+            "message_type": "task_event",
+            "target": "freertos-qemu-rv32",
+            "task_id": "sensor-sampler",
+            "event": "task_progress",
+            "checkpoint_size_bytes": 24,
+        }
+        with self.assertRaisesRegex(
+            EmbeddedTelemetryError, "task event fields do not match schema"
+        ):
+            validate_task_event(event)
+
+    def test_control_loop_checkpoint_event_is_not_supported(self) -> None:
+        from twincoreos.embedded_telemetry import _checkpoint_integrity_hash
+
+        with self.assertRaisesRegex(
+            EmbeddedTelemetryError, "checkpoint task identity is unsupported"
+        ):
+            _checkpoint_integrity_hash(4, 2089706401, "control-loop")
+
+        event = {
+            "schema_version": 1,
+            "message_type": "task_event",
+            "target": "freertos-qemu-rv32",
+            "task_id": "control-loop",
+            "event": "checkpoint_saved",
+            "counter": 4,
+            "accumulator": 2089706401,
+            "integrity_hash": 0,
+            "checkpoint_size_bytes": 24,
+        }
+        with self.assertRaisesRegex(
+            EmbeddedTelemetryError, "checkpoint task identity is unsupported"
+        ):
+            validate_task_event(event)
+
+    def test_fault_injection_events_are_valid_task_events(self) -> None:
+        for name in ("fault_injection_requested", "fault_injected"):
+            event = {
+                "schema_version": 1,
+                "message_type": "task_event",
+                "target": "freertos-qemu-rv32",
+                "task_id": "sensor-sampler",
+                "event": name,
+            }
+            self.assertEqual(validate_task_event(event), event)
 
     def test_failure_events_are_not_misreported_as_checkpoint_success(self) -> None:
         failure = {

@@ -58,21 +58,20 @@ class EmbeddedRiskPolicy:
             "target": EMBEDDED_TARGET,
             "task_id": task_id,
             "risk_level": "unknown",
+            "risk_category": "UNKNOWN",
+            "risk_index": None,
+            "telemetry_freshness": "unknown",
             "recommendation": "none",
+            "checkpoint_supported": task_id in EMBEDDED_CHECKPOINT_TASK_IDS,
             "matched_rules": [],
             "observed_inputs": {},
             "assessed_at_utc": assessed_at_utc,
             "limitations": [
-                "This is an operational heuristic, not a trained or calibrated failure predictor."
+                "This is not a trained or calibrated failure predictor; the discrete policy index is not a failure probability."
             ],
         }
         if not isinstance(task_id, str) or task_id not in EMBEDDED_TASK_IDS:
             assessment["reason"] = "unsupported embedded task identity"
-            return assessment
-        if task_id not in EMBEDDED_CHECKPOINT_TASK_IDS:
-            assessment["reason"] = (
-                "application-level checkpointing is not implemented for this task"
-            )
             return assessment
         if sample is None:
             assessment["reason"] = "no embedded telemetry has been received"
@@ -149,6 +148,11 @@ class EmbeddedRiskPolicy:
             "stack_high_water_mark_words": sample["stack_high_water_mark_words"],
             "received_at_utc": received_time.astimezone(timezone.utc).isoformat(),
             "telemetry_age_seconds": age_seconds,
+            **(
+                {"run_id": sample["run_id"]}
+                if isinstance(sample.get("run_id"), str)
+                else {}
+            ),
         }
         assessment["policy_configuration"] = {
             "minimum_stack_high_water_words": self.minimum_stack_high_water_words,
@@ -156,28 +160,67 @@ class EmbeddedRiskPolicy:
         }
 
         if age_seconds > self.stale_after_seconds:
+            assessment["telemetry_freshness"] = "stale"
             assessment["matched_rules"] = ["telemetry_stale"]
             assessment["reason"] = (
                 "telemetry is stale; current task state cannot be assessed"
             )
             return assessment
 
-        if sample["task_state"] != "running":
-            assessment["reason"] = (
-                "checkpoint recommendation requires a currently running task"
-            )
-            return assessment
-
+        assessment["telemetry_freshness"] = "fresh"
         high_water = sample["stack_high_water_mark_words"]
         assessment["risk_level"] = "normal"
-        assessment["reason"] = "no configured operational-risk rule matched"
+        assessment["risk_category"] = "LOW"
+        assessment["risk_index"] = 0
+        assessment["reason"] = (
+            f"fresh measured stack reserve of {high_water} words is above the "
+            f"configured {self.minimum_stack_high_water_words}-word threshold; "
+            "no elevated-risk rule matched"
+        )
         if high_water <= self.minimum_stack_high_water_words:
             assessment["risk_level"] = "elevated"
-            assessment["recommendation"] = "checkpoint_recommended"
+            assessment["risk_category"] = "ELEVATED"
+            assessment["risk_index"] = 100
             assessment["matched_rules"] = [
                 "stack_high_water_at_or_below_configured_minimum"
             ]
+            if task_id in EMBEDDED_CHECKPOINT_TASK_IDS:
+                if sample["task_state"] == "running":
+                    assessment["recommendation"] = "checkpoint_recommended"
+                    assessment["reason"] = (
+                        "measured unused stack reserve is at or below the configured "
+                        "threshold; application-state checkpointing is supported"
+                    )
+                else:
+                    assessment["reason"] = (
+                        "measured unused stack reserve is at or below the configured "
+                        "threshold, but the task is not running and cannot be "
+                        "checkpointed at this time"
+                    )
+            else:
+                assessment["recommendation"] = "checkpoint_unsupported"
+                assessment["reason"] = (
+                    "measured unused stack reserve is at or below the configured "
+                    "threshold, but checkpointing is not enabled for control-loop"
+                )
+        elif sample["task_state"] in {"suspended", "deleted"}:
+            assessment["risk_level"] = "elevated"
+            assessment["risk_category"] = "ELEVATED"
+            assessment["risk_index"] = 100
+            assessment["matched_rules"] = ["task_not_running"]
             assessment["reason"] = (
-                "measured unused stack reserve is at or below the configured threshold"
+                f"task reported state {sample['task_state']}; "
+                "checkpoint recommendations require a running task"
             )
+        elif sample["task_state"] != "running":
+            assessment["reason"] = (
+                f"task reported state {sample['task_state']}; "
+                "checkpoint recommendations require a running task"
+            )
+        assessment["policy_configuration"]["risk_index_definition"] = {
+            "LOW": 0,
+            "ELEVATED": 100,
+            "CRITICAL": 100,
+            "UNKNOWN": None,
+        }
         return assessment

@@ -1,4 +1,5 @@
 import argparse
+import logging
 import math
 import signal
 import sys
@@ -7,6 +8,10 @@ from pathlib import Path
 
 from twincoreos.api import serve
 from twincoreos.embedded_telemetry import EmbeddedBridgeError, run_bridge
+from twincoreos.embedded_ml import (
+    DEFAULT_EMBEDDED_DATA_DIR,
+    DEFAULT_EMBEDDED_MODEL_PATH,
+)
 from twincoreos.monitor import MonitoringInterrupted, monitor
 from twincoreos.recovery import RecoveryError
 from twincoreos.runtime import MonitorRuntime, RuntimeUnavailableError
@@ -32,6 +37,14 @@ def main() -> int:
         default=Path(".twincoreos/checkpoints"),
     )
     monitor_command.add_argument(
+        "--risk-model",
+        type=Path,
+        default=Path(".twincoreos/models/host-isolation-forest.joblib"),
+        help="trusted trained host-telemetry model artifact",
+    )
+    monitor_command.add_argument("--normal-risk-score", type=float, default=0.0)
+    monitor_command.add_argument("--anomaly-risk-score", type=float, default=0.60)
+    monitor_command.add_argument(
         "--inject-fault-worker",
         metavar="WORKER_ID",
         help="terminate this supervised worker after its first telemetry sample, then attempt verified recovery",
@@ -50,10 +63,30 @@ def main() -> int:
         "--checkpoint-dir", type=Path, default=Path(".twincoreos/checkpoints")
     )
     serve_command.add_argument(
+        "--risk-model",
+        type=Path,
+        default=Path(".twincoreos/models/host-isolation-forest.joblib"),
+        help="trusted trained host-telemetry model artifact",
+    )
+    serve_command.add_argument("--normal-risk-score", type=float, default=0.0)
+    serve_command.add_argument("--anomaly-risk-score", type=float, default=0.60)
+    serve_command.add_argument(
         "--embedded-stack-reserve-threshold-words",
         type=int,
         default=32,
         help="recommend embedded checkpoint at or below this FreeRTOS stack reserve",
+    )
+    serve_command.add_argument(
+        "--embedded-data-dir",
+        type=Path,
+        default=DEFAULT_EMBEDDED_DATA_DIR,
+        help="separate append-only embedded UART dataset and shadow-decision directory",
+    )
+    serve_command.add_argument(
+        "--embedded-ml-model",
+        type=Path,
+        default=DEFAULT_EMBEDDED_MODEL_PATH,
+        help="optional compatible embedded Isolation Forest artifact for shadow inference",
     )
     serve_command.add_argument("--startup-timeout", type=float, default=10.0)
     serve_command.add_argument("--shutdown-timeout", type=float, default=5.0)
@@ -75,9 +108,18 @@ def main() -> int:
         "--api-url",
         default="http://127.0.0.1:8765/api/embedded/telemetry",
     )
+    bridge_command.add_argument(
+        "--inject-stack-pressure",
+        choices=("sensor-sampler",),
+        help="after both tasks report normal fresh telemetry, inject bounded stack pressure over QEMU UART",
+    )
     bridge_command.add_argument("--qemu", default="qemu-system-riscv32")
     bridge_command.add_argument("--shutdown-timeout", type=float, default=5.0    )
     args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
     if args.command == "embedded-bridge":
         bridge_stop = threading.Event()
 
@@ -93,6 +135,7 @@ def main() -> int:
                     api_url=args.api_url,
                     qemu=args.qemu,
                     shutdown_timeout=args.shutdown_timeout,
+                    inject_stack_pressure_task=args.inject_stack_pressure,
                     stop_requested=bridge_stop.is_set,
                 )
             except EmbeddedBridgeError as error:
@@ -115,6 +158,18 @@ def main() -> int:
             parser.error("--checkpoint-interval must be at least --sample-interval")
         if args.checkpoint_budget_bytes <= 0:
             parser.error("--checkpoint-budget-bytes must be greater than 0")
+        if (
+            not math.isfinite(args.normal_risk_score)
+            or not 0 <= args.normal_risk_score <= 1
+        ):
+            parser.error("--normal-risk-score must be between 0 and 1")
+        if (
+            not math.isfinite(args.anomaly_risk_score)
+            or not 0 <= args.anomaly_risk_score <= 1
+        ):
+            parser.error("--anomaly-risk-score must be between 0 and 1")
+        if args.anomaly_risk_score < args.normal_risk_score:
+            parser.error("--anomaly-risk-score must be >= --normal-risk-score")
         if args.embedded_stack_reserve_threshold_words < 0:
             parser.error(
                 "--embedded-stack-reserve-threshold-words must be non-negative"
@@ -125,19 +180,28 @@ def main() -> int:
             parser.error("--shutdown-timeout must be greater than 0")
         if not 1 <= args.port <= 65535:
             parser.error("--port must be between 1 and 65535")
-        runtime = MonitorRuntime(
-            workers=args.workers,
-            memory_mib=args.memory_mib,
-            sample_interval=args.sample_interval,
-            checkpoint_interval=args.checkpoint_interval,
-            checkpoint_budget_bytes=args.checkpoint_budget_bytes,
-            checkpoint_dir=args.checkpoint_dir,
-            embedded_stack_reserve_threshold_words=(
-                args.embedded_stack_reserve_threshold_words
-            ),
-            startup_timeout=args.startup_timeout,
-            shutdown_timeout=args.shutdown_timeout,
-        )
+        try:
+            runtime = MonitorRuntime(
+                workers=args.workers,
+                memory_mib=args.memory_mib,
+                sample_interval=args.sample_interval,
+                checkpoint_interval=args.checkpoint_interval,
+                checkpoint_budget_bytes=args.checkpoint_budget_bytes,
+                checkpoint_dir=args.checkpoint_dir,
+                embedded_stack_reserve_threshold_words=(
+                    args.embedded_stack_reserve_threshold_words
+                ),
+                startup_timeout=args.startup_timeout,
+                shutdown_timeout=args.shutdown_timeout,
+                risk_model_path=args.risk_model,
+                normal_risk_score=args.normal_risk_score,
+                anomaly_risk_score=args.anomaly_risk_score,
+                embedded_data_dir=args.embedded_data_dir,
+                embedded_ml_model_path=args.embedded_ml_model,
+            )
+        except (OSError, ValueError) as error:
+            print(f"Could not initialize monitor runtime: {error}", file=sys.stderr)
+            return 1
         api_stop = threading.Event()
         api_signal: int | None = None
 
@@ -188,6 +252,18 @@ def main() -> int:
         parser.error("--checkpoint-interval must be greater than 0")
     if args.checkpoint_budget_bytes <= 0:
         parser.error("--checkpoint-budget-bytes must be greater than 0")
+    if (
+        not math.isfinite(args.normal_risk_score)
+        or not 0 <= args.normal_risk_score <= 1
+    ):
+        parser.error("--normal-risk-score must be between 0 and 1")
+    if (
+        not math.isfinite(args.anomaly_risk_score)
+        or not 0 <= args.anomaly_risk_score <= 1
+    ):
+        parser.error("--anomaly-risk-score must be between 0 and 1")
+    if args.anomaly_risk_score < args.normal_risk_score:
+        parser.error("--anomaly-risk-score must be >= --normal-risk-score")
     if args.checkpoint_interval < args.sample_interval:
         parser.error("--checkpoint-interval must be at least --sample-interval")
     valid_worker_ids = {f"worker-{index}" for index in range(1, args.workers + 1)}
@@ -219,6 +295,9 @@ def main() -> int:
                 checkpoint_interval=args.checkpoint_interval,
                 checkpoint_budget_bytes=args.checkpoint_budget_bytes,
                 checkpoint_dir=args.checkpoint_dir,
+                risk_model_path=args.risk_model,
+                normal_risk_score=args.normal_risk_score,
+                anomaly_risk_score=args.anomaly_risk_score,
                 fault_worker_id=args.inject_fault_worker,
                 stop_requested=lambda: requested_signal,
                 stop_event=stop_event,

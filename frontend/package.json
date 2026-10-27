@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test src/embeddedRisk.test.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.4.1",

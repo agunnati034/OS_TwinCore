@@ -25,17 +25,22 @@ FIRMWARE = (
 )
 
 
-def expected_accumulator(accumulator: int, counter: int) -> int:
-    for iteration in range(128):
+def expected_accumulator(
+    accumulator: int, counter: int, work_iterations: int = 128
+) -> int:
+    for iteration in range(work_iterations):
         accumulator = (
             (accumulator * 33) ^ (counter + iteration + 0x9E3779B9)
         ) & 0xFFFFFFFF
     return accumulator
 
 
-def checkpoint_hash(counter: int, accumulator: int) -> int:
+def checkpoint_hash(
+    counter: int, accumulator: int, task_id: str = "sensor-sampler"
+) -> int:
     result = 2166136261
-    for value in (0x54434F53, 1, 1, counter, accumulator):
+    numeric_task_id = {"sensor-sampler": 1, "control-loop": 2}[task_id]
+    for value in (0x54434F53, 1, numeric_task_id, counter, accumulator):
         for byte in value.to_bytes(4, "little"):
             result = ((result ^ byte) * 16777619) & 0xFFFFFFFF
     return result
@@ -46,7 +51,7 @@ def checkpoint_hash(counter: int, accumulator: int) -> int:
     "qemu-system-riscv32 is unavailable",
 )
 class EmbeddedRecoveryQemuTests(unittest.TestCase):
-    def test_sensor_task_checkpoint_restart_restore_and_progress(self) -> None:
+    def test_sensor_checkpoint_recovers_and_control_loop_is_not_checkpointed(self) -> None:
         if not FIRMWARE.is_file():
             self.skipTest("Build firmware first with `make -C embedded build`")
 
@@ -82,7 +87,8 @@ class EmbeddedRecoveryQemuTests(unittest.TestCase):
         malformed_lines: list[str] = []
         buffer = bytearray()
         command_sent = False
-        deadline = time.monotonic() + 20.0
+        invalid_command_sent = False
+        deadline = time.monotonic() + 30.0
         try:
             assert process.stdout is not None
             descriptor = process.stdout.fileno()
@@ -116,12 +122,16 @@ class EmbeddedRecoveryQemuTests(unittest.TestCase):
                             and record.get("task_id") == "sensor-sampler"
                         ):
                             self.assertIsNotNone(process.stdin)
+                            process.stdin.write(b"CHECKPOINT control-loop\n")
+                            process.stdin.flush()
+                            invalid_command_sent = True
                             process.stdin.write(b"CHECKPOINT sensor-sampler\n")
                             process.stdin.flush()
                             command_sent = True
                         if (
                             record.get("message_type") == "task_event"
                             and record.get("event") == "recovery_completed"
+                            and record.get("task_id") == "sensor-sampler"
                         ):
                             break
                 else:
@@ -148,84 +158,168 @@ class EmbeddedRecoveryQemuTests(unittest.TestCase):
         ]
         event_names = [record.get("event") for record in events]
         self.assertNotIn("recovery_failed", event_names, event_names)
+        self.assertTrue(invalid_command_sent)
+        self.assertTrue(command_sent)
+        self.assertEqual(
+            [
+                record["task_id"]
+                for record in events
+                if record.get("event") == "checkpoint_requested"
+            ],
+            ["sensor-sampler"],
+        )
+        self.assertFalse(
+            any(
+                record.get("task_id") == "control-loop"
+                and record.get("event")
+                in {
+                    "checkpoint_requested",
+                    "checkpoint_saved",
+                    "checkpoint_failed",
+                    "task_restart_started",
+                    "task_restarted",
+                    "restore_started",
+                    "restore_succeeded",
+                    "restore_failed",
+                    "task_progress",
+                    "recovery_completed",
+                    "recovery_failed",
+                }
+                for record in events
+            ),
+            "control-loop must not emit checkpoint or recovery events",
+        )
         required_sequence = [
             "checkpoint_saved",
+            "restore_started",
             "task_restart_started",
             "task_restarted",
             "restore_succeeded",
             "task_progress",
             "recovery_completed",
         ]
-        missing_events = [name for name in required_sequence if name not in event_names]
+        missing_events = [
+            f"{task_id}:{name}"
+            for task_id in ("sensor-sampler",)
+            for name in required_sequence
+            if not any(
+                record.get("task_id") == task_id
+                and record.get("event") == name
+                for record in events
+            )
+        ]
         self.assertFalse(
             missing_events,
             f"missing events {missing_events}; captured events: {event_names!r}; "
             f"malformed UART lines: {malformed_lines!r}",
         )
-        positions = [event_names.index(name) for name in required_sequence]
-        self.assertEqual(positions, sorted(positions), event_names)
-
-        checkpoint = next(
-            record for record in events if record.get("event") == "checkpoint_saved"
-        )
-        restarted = next(
-            record for record in events if record.get("event") == "task_restarted"
-        )
-        restored = next(
-            record for record in events if record.get("event") == "restore_succeeded"
-        )
-        progress = next(
-            record for record in events if record.get("event") == "task_progress"
-        )
-        completed = next(
-            record for record in events if record.get("event") == "recovery_completed"
-        )
-
-        saved_counter = checkpoint["counter"]
-        saved_accumulator = checkpoint["accumulator"]
-        saved_hash = checkpoint["integrity_hash"]
-        self.assertIsInstance(saved_counter, int)
-        self.assertIsInstance(saved_accumulator, int)
         self.assertEqual(
-            saved_hash, checkpoint_hash(saved_counter, saved_accumulator)
+            sum(name == "task_restart_started" for name in event_names),
+            1,
+            event_names,
         )
-        for record in (restarted, restored):
-            self.assertEqual(record["counter"], saved_counter)
-            self.assertEqual(record["accumulator"], saved_accumulator)
-            self.assertEqual(record["integrity_hash"], saved_hash)
-        self.assertEqual(progress["counter"], saved_counter + 1)
         self.assertEqual(
-            progress["accumulator"],
-            expected_accumulator(saved_accumulator, saved_counter + 1),
+            sum(name == "task_restarted" for name in event_names),
+            1,
+            event_names,
         )
-        self.assertEqual(completed["counter"], progress["counter"])
-        self.assertEqual(completed["accumulator"], progress["accumulator"])
+        saved_states: dict[str, tuple[int, int]] = {}
+        for task_id, work_iterations in (("sensor-sampler", 128),):
+            task_events = [
+                record for record in events if record.get("task_id") == task_id
+            ]
+            positions = [
+                next(
+                    index
+                    for index, record in enumerate(task_events)
+                    if record.get("event") == name
+                )
+                for name in required_sequence
+            ]
+            self.assertEqual(positions, sorted(positions), task_events)
+            checkpoint = next(
+                record
+                for record in task_events
+                if record.get("event") == "checkpoint_saved"
+            )
+            restarted = next(
+                record
+                for record in task_events
+                if record.get("event") == "task_restarted"
+            )
+            restored = next(
+                record
+                for record in task_events
+                if record.get("event") == "restore_succeeded"
+            )
+            progress = next(
+                record
+                for record in task_events
+                if record.get("event") == "task_progress"
+            )
+            completed = next(
+                record
+                for record in task_events
+                if record.get("event") == "recovery_completed"
+            )
+
+            saved_counter = checkpoint["counter"]
+            saved_accumulator = checkpoint["accumulator"]
+            saved_hash = checkpoint["integrity_hash"]
+            self.assertIsInstance(saved_counter, int)
+            self.assertIsInstance(saved_accumulator, int)
+            self.assertEqual(
+                saved_hash,
+                checkpoint_hash(saved_counter, saved_accumulator, task_id),
+            )
+            for record in (restarted, restored):
+                self.assertEqual(record["counter"], saved_counter)
+                self.assertEqual(record["accumulator"], saved_accumulator)
+                self.assertEqual(record["integrity_hash"], saved_hash)
+            self.assertEqual(progress["counter"], saved_counter + 1)
+            self.assertEqual(
+                progress["accumulator"],
+                expected_accumulator(
+                    saved_accumulator, saved_counter + 1, work_iterations
+                ),
+            )
+            self.assertEqual(completed["counter"], progress["counter"])
+            self.assertEqual(completed["accumulator"], progress["accumulator"])
+            saved_states[task_id] = (saved_counter, saved_accumulator)
 
         telemetry = [
             (index, record)
             for index, record in enumerate(records)
             if record.get("message_type") == "task_telemetry"
         ]
-        restarted_record_index = records.index(restarted)
-        completed_record_index = records.index(completed)
+        sensor_restored_index = records.index(
+            next(
+                record
+                for record in events
+                if record.get("task_id") == "sensor-sampler"
+                and record.get("event") == "restore_succeeded"
+            )
+        )
         restored_telemetry = [
             (index, record)
             for index, record in telemetry
             if record.get("task_id") == "sensor-sampler"
-            and record.get("execution_count") == saved_counter + 1
+            and index > sensor_restored_index
+            and record.get("execution_count")
+            == saved_states["sensor-sampler"][0] + 1
         ]
         self.assertTrue(restored_telemetry, "restored task did not emit next count")
-        self.assertGreater(restored_telemetry[0][0], records.index(restored))
+        self.assertGreater(restored_telemetry[0][0], sensor_restored_index)
         self.assertLess(restored_telemetry[0][0], records.index(progress))
-        control_after_restart = [
+        control_during_recovery = [
             (index, record)
             for index, record in telemetry
             if record.get("task_id") == "control-loop"
-            and restarted_record_index < index < completed_record_index
+            and sensor_restored_index < index < records.index(completed)
         ]
         self.assertTrue(
-            control_after_restart,
-            "control-loop emitted no telemetry while recovery was in progress",
+            control_during_recovery,
+            "control-loop telemetry did not continue while sensor-sampler recovered",
         )
         self.assertGreaterEqual(
             len([record for _, record in telemetry if record.get("task_id") == "control-loop"]),
